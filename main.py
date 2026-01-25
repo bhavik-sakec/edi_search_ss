@@ -7,17 +7,15 @@ Usage:
     # Single field
     python main.py --file EDI.txt --word "BHT03"
     
-    # Multiple fields (comma-separated)
-    python main.py --file EDI.txt --word "BHT03,CLM05,DTP01"
-    
     # List of fields
     python main.py --file EDI.txt --list BHT03 BHT04 CLM05
     
     # Text file input (one field per line)
     python main.py --file EDI.txt --txt fields.txt
     
-    # Excel input
-    python main.py --file EDI.txt --excel input.xlsx
+    # Excel input (columns: 'GDF Field' for filename, 'EDI Field' for search term)
+    # Supports complex EDI formats like: 2300CLM05-1, 2010AANM109, 2300DTP03 - 434
+    python main.py --file EDI.txt --excel Book1.xlsx
 """
 
 import subprocess
@@ -31,6 +29,11 @@ import re
 import win32gui
 import win32con
 from PIL import Image, ImageDraw
+import msvcrt  # For keyboard input on Windows
+
+# Disable pyautogui's built-in pause between actions
+pyautogui.PAUSE = 0
+pyautogui.FAILSAFE = True  # Move mouse to corner to abort
 
 # Optional: pandas for Excel support
 try:
@@ -105,10 +108,255 @@ def parse_field_code(field_code: str) -> tuple:
     return field_code, '', None, f"{field_code}*"
 
 
+def parse_edi_field(edi_field: str) -> str:
+    """
+    Parses complex EDI field formats and returns the search term.
+    Based on ASC X12 837 Professional (005010X222A1) implementation guide.
+    
+    Supported formats and search patterns:
+        BHT03/BHT04                 -> 'BHT*'           - Transaction header
+        2300CLM05-1                 -> 'CLM*'           - Claim
+        2010AANM109                 -> 'NM1*85*'        - Billing provider (2010AA loop)
+        2310BNM109                  -> 'NM1*82*'        - Rendering provider (2310B loop)
+        2010BANM109                 -> 'NM1*IL*'        - Subscriber (2010BA loop)
+        2300DTP03 - 434             -> 'DTP*434*'       - Claim service date
+        2300DTP03 - 435             -> 'DTP*435*'       - Discharge date
+        2400DTP03 - 472             -> 'DTP*472*'       - Service line date
+        2300HI01-2 -- BK/ABK        -> 'HI*ABK:'        - Diagnosis codes
+        2410LIN03 -- N4             -> 'LIN**N4'        - NDC drug code
+    
+    Returns: search_term (e.g., 'NM1*85*', 'DTP*434*', 'HI*ABK:')
+    """
+    original_field = edi_field.strip()
+    edi_field = original_field
+    
+    # Handle combined fields (e.g., "2300CLM05-1 + 2300CLM05-3") - use first field
+    if ' + ' in edi_field:
+        edi_field = edi_field.split(' + ')[0].strip()
+    
+    # Extract qualifier if present
+    qualifier = None
+    qualifier_type = None  # 'dash' for " - " or 'double_dash' for " -- "
+    
+    if ' -- ' in edi_field:
+        parts = edi_field.split(' -- ')
+        edi_field = parts[0].strip()
+        qualifier = parts[1].strip() if len(parts) > 1 else None
+        qualifier_type = 'double_dash'
+    elif ' - ' in edi_field:
+        # Handle " - DR" format (space dash space)
+        parts = edi_field.split(' - ')
+        edi_field = parts[0].strip()
+        qualifier = parts[1].strip() if len(parts) > 1 else None
+        qualifier_type = 'dash'
+    elif ' -' in edi_field:
+        # Handle " -BG" format (space before dash, no space after, followed by letters)
+        match = re.search(r' -([A-Za-z/]+)', edi_field)
+        if match:
+            qualifier = match.group(1).strip()
+            edi_field = edi_field[:edi_field.find(' -')].strip()
+            qualifier_type = 'dash'
+    
+    # Special handling for HI segments with qualifier attached (e.g., "2300HI01-2-ABJ/BJ")
+    # Pattern: ...HI##-#-QUALIFIER
+    if not qualifier and 'HI' in edi_field.upper():
+        hi_match = re.search(r'HI(\d+)-(\d+)-([A-Za-z/]+)$', edi_field, re.IGNORECASE)
+        if hi_match:
+            qualifier = hi_match.group(3)
+            edi_field = edi_field[:edi_field.rfind('-' + qualifier)]
+            qualifier_type = 'attached'
+    
+    # Extract loop ID if present (e.g., 2010AA, 2310B, 2300, 2400, 2410)
+    loop_id = None
+    loop_match = re.match(r'^(\d{4}[A-Z]{0,2})', edi_field.upper())
+    if loop_match:
+        loop_id = loop_match.group(1)
+    
+    # Known 3-character segments that have numbers in their name
+    NUMBERED_SEGMENTS_3 = ['NM1', 'SV1', 'SV2', 'SV3', 'SV4', 'SV5', 'TA1', 'CL1']
+    
+    # Known 2-character segments
+    SEGMENTS_2 = ['N1', 'N2', 'N3', 'N4', 'HI', 'HL', 'K3', 'G1', 'G2', 'G3', 'LX', 'SE', 'ST', 'GS', 'GE']
+    
+    # Known 3-character segments (no numbers)
+    SEGMENTS_3 = ['CLM', 'BHT', 'DTP', 'REF', 'AMT', 'QTY', 'DMG', 'PAT', 'SBR', 'CAS', 'OI', 'MOA', 'LIN', 'CTP', 'PRV', 'CN1', 'PWK', 'CR1', 'CR2', 'CR3', 'CR5', 'CR6', 'CRC', 'HCP', 'TST', 'MEA', 'PER']
+    
+    segment = None
+    
+    # First, try to find known 3-char numbered segments (like NM1, SV1)
+    for seg in NUMBERED_SEGMENTS_3:
+        if seg in edi_field.upper():
+            segment = seg
+            break
+    
+    # Try to find known 3-char segments
+    if not segment:
+        for seg in SEGMENTS_3:
+            if seg in edi_field.upper():
+                segment = seg
+                break
+    
+    # Try to find known 2-char segments  
+    if not segment:
+        for seg in SEGMENTS_2:
+            idx = edi_field.upper().find(seg)
+            if idx >= 0:
+                rest = edi_field[idx + len(seg):]
+                if rest and rest[0].isdigit():
+                    segment = seg
+                    break
+    
+    # Pattern 2: Simple format (e.g., BHT04, CLM05)
+    if not segment:
+        match = re.match(r'^([A-Za-z]+\d?)(\d+)(?:-\d+)?$', edi_field)
+        if match:
+            segment = match.group(1).upper()
+    
+    # Pattern 3: Try to extract alphabetic prefix as segment
+    if not segment:
+        match = re.match(r'^(\d*)([A-Za-z]+\d?)([A-Za-z]*)(\d+)', edi_field)
+        if match:
+            seg_candidate = (match.group(2) + match.group(3)).upper()
+            for seg in NUMBERED_SEGMENTS_3 + SEGMENTS_3:
+                if seg in seg_candidate:
+                    segment = seg
+                    break
+            if not segment:
+                for seg in SEGMENTS_2:
+                    if seg_candidate.endswith(seg) or seg in seg_candidate:
+                        segment = seg
+                        break
+    
+    # Last resort: use parse_field_code for simple formats
+    if not segment:
+        seg, element_num, sub_element, search_term = parse_field_code(edi_field)
+        segment = seg
+    
+    # ================================================================
+    # Build search term based on segment type and loop context
+    # Following ASC X12 837P (005010X222A1) patterns
+    # ================================================================
+    
+    # NM1 segments - need entity identifier
+    if segment == 'NM1':
+        # Determine entity type based on loop ID
+        if loop_id:
+            if '2010AA' in loop_id:
+                return "NM1*85*"  # Billing provider
+            elif '2010AB' in loop_id:
+                return "NM1*87*"  # Pay-to provider
+            elif '2010AC' in loop_id:
+                return "NM1*PE*"  # Pay-to plan
+            elif '2010BA' in loop_id:
+                return "NM1*IL*"  # Subscriber
+            elif '2010BB' in loop_id:
+                return "NM1*PR*"  # Payer
+            elif '2010CA' in loop_id:
+                return "NM1*QC*"  # Patient
+            elif '2310A' in loop_id:
+                return "NM1*DN*"  # Referring provider
+            elif '2310B' in loop_id:
+                return "NM1*82*"  # Rendering provider
+            elif '2310C' in loop_id:
+                return "NM1*77*"  # Service facility
+            elif '2310D' in loop_id:
+                return "NM1*DQ*"  # Supervising provider
+            elif '2330' in loop_id:
+                return "NM1*"     # Other subscriber (various)
+            elif '2420' in loop_id:
+                return "NM1*82*"  # Line rendering provider
+        return "NM1*"
+    
+    # HI segments - diagnosis codes with qualifier
+    if segment == 'HI':
+        if qualifier:
+            # Handle "/" separator (e.g., "BK/ABK")
+            if '/' in qualifier:
+                hi_qualifier = qualifier.split('/')[-1].strip()
+            else:
+                hi_qualifier = qualifier
+            return f"HI*{hi_qualifier}"
+        return "HI*"
+    
+    # DTP segments - date qualifier
+    if segment == 'DTP':
+        if qualifier:
+            # Handle RD8 date range format
+            if 'RD8' in qualifier.upper():
+                match = re.match(r'(\d+)', qualifier)
+                if match:
+                    return f"DTP*{match.group(1)}*RD8"
+            else:
+                # Just the date qualifier (434, 435, 472, etc.)
+                num_match = re.match(r'(\d+)', qualifier)
+                if num_match:
+                    return f"DTP*{num_match.group(1)}*"
+        return "DTP*"
+    
+    # REF segments - need qualifier based on loop
+    if segment == 'REF':
+        if loop_id:
+            if '2010AA' in loop_id:
+                return "REF*EI*"  # Billing provider tax ID
+            elif '2310B' in loop_id:
+                return "REF*"    # Rendering provider secondary ID
+        return "REF*"
+    
+    # LIN segments - drug identification
+    if segment == 'LIN':
+        if qualifier and 'N4' in qualifier.upper():
+            return "LIN**N4*"  # NDC code
+        return "LIN*"
+    
+    # N4 segments - address
+    if segment == 'N4':
+        return "N4*"
+    
+    # N3 segments - address line
+    if segment == 'N3':
+        return "N3*"
+    
+    # PRV segments - provider info
+    if segment == 'PRV':
+        return "PRV*"
+    
+    # SV1/SV2 segments - service line
+    if segment in ['SV1', 'SV2']:
+        return f"{segment}*"
+    
+    # LX segments - line counter
+    if segment == 'LX':
+        return "LX*"
+    
+    # CTP segments - drug pricing
+    if segment == 'CTP':
+        return "CTP*"
+    
+    # DMG segments - demographic info
+    if segment == 'DMG':
+        return "DMG*"
+    
+    # CN1 segments - contract info
+    if segment == 'CN1':
+        return "CN1*"
+    
+    # CL1 segments - institutional claim code
+    if segment == 'CL1':
+        return "CL1*"
+    
+    # HCP segments - repricing
+    if segment == 'HCP':
+        return "HCP*"
+    
+    # Default: just segment name
+    return f"{segment}*"
+
+
 def load_from_excel(excel_path: str) -> list:
     """
     Loads search terms from Excel file.
-    Expected columns: 'File name' (for screenshot name) and 'Field' (for search term like BHT03)
+    Expected columns: 'GDF Field' (for screenshot name) and 'EDI Field' (for search term)
+    Also supports legacy format with 'File name' and 'Field' columns.
     
     Returns list of tuples: [(screenshot_name, field_code, search_term), ...]
     """
@@ -126,14 +374,23 @@ def load_from_excel(excel_path: str) -> list:
     file_name_col = None
     field_col = None
     
+    # Check for new format: 'GDF Field' and 'EDI Field'
     for key, col in columns_lower.items():
-        if 'file' in key and 'name' in key:
+        if 'gdf' in key and 'field' in key:
             file_name_col = col
-        elif 'field' in key:
+        elif 'edi' in key and 'field' in key:
             field_col = col
     
+    # Fallback to legacy format: 'File name' and 'Field'
     if file_name_col is None or field_col is None:
-        raise ValueError(f"Excel must have 'File name' and 'Field' columns. Found: {list(df.columns)}")
+        for key, col in columns_lower.items():
+            if 'file' in key and 'name' in key:
+                file_name_col = col
+            elif 'field' in key and file_name_col != col:
+                field_col = col
+    
+    if file_name_col is None or field_col is None:
+        raise ValueError(f"Excel must have 'GDF Field' and 'EDI Field' columns (or 'File name' and 'Field'). Found: {list(df.columns)}")
     
     results = []
     for _, row in df.iterrows():
@@ -141,7 +398,8 @@ def load_from_excel(excel_path: str) -> list:
         field_code = str(row[field_col]).strip()
         
         if field_code and field_code.lower() != 'nan':
-            segment, element_num, sub_element, search_term = parse_field_code(field_code)
+            # Use new parser for complex EDI field formats
+            search_term = parse_edi_field(field_code)
             results.append((file_name, field_code, search_term))
     
     return results
@@ -199,14 +457,14 @@ def open_notepad_plus_with_file(file_path: str):
         notepad_exe = "notepad++.exe"
     
     process = subprocess.Popen([notepad_exe, file_path])
-    time.sleep(2)
+    time.sleep(1)  # Reduced from 2s
     
     NOTEPAD_HWND = find_notepad_window()
     if NOTEPAD_HWND:
         win32gui.ShowWindow(NOTEPAD_HWND, win32con.SW_MAXIMIZE)
-        time.sleep(0.3)
+        time.sleep(0.1)  # Reduced from 0.3s
         win32gui.SetForegroundWindow(NOTEPAD_HWND)
-        time.sleep(0.3)
+        time.sleep(0.1)  # Reduced from 0.3s
     
     return process
 
@@ -237,62 +495,67 @@ def ensure_notepad_focus():
             win32gui.SetForegroundWindow(NOTEPAD_HWND)
         except:
             pass
-        time.sleep(0.1)
+        time.sleep(0.05)  # Reduced from 0.1s
         return NOTEPAD_HWND
     return None
 
 
-def search_and_highlight(search_text: str) -> bool:
+def search_and_highlight(search_text: str, dialog_open: bool = False) -> bool:
     """
     Searches for text in Notepad++ and highlights the entire line.
     Returns True if text was found, False otherwise.
+    
+    Args:
+        search_text: Text to search for
+        dialog_open: If True, assumes Find dialog is already open (faster)
     """
-    ensure_notepad_focus()
+    if not dialog_open:
+        ensure_notepad_focus()
     
-    # Get caret position before search to detect if search was successful
-    before_pos = get_caret_position()
+    # Open Find dialog only if not already open
+    if not dialog_open:
+        pyautogui.hotkey('ctrl', 'f')
+        time.sleep(0.1)
     
-    # Open Find dialog
-    pyautogui.hotkey('ctrl', 'f')
-    time.sleep(0.5)
-    
-    # Clear and type search text
+    # Clear and type search text (Ctrl+A to select all in search box)
     pyautogui.hotkey('ctrl', 'a')
-    time.sleep(0.1)
+    time.sleep(0.02)
     
     pyperclip.copy(search_text)
     pyautogui.hotkey('ctrl', 'v')
-    time.sleep(0.3)
+    time.sleep(0.05)
     
     # Find Next
     pyautogui.press('enter')
-    time.sleep(0.5)
-    
-    # Close Find dialog
-    pyautogui.press('escape')
-    time.sleep(0.3)
-    
-    # Get caret position after search
-    after_pos = get_caret_position()
-    
-    # Check if caret moved (indicating text was found)
-    # If positions are very similar, text was likely not found
-    found = True
-    if before_pos and after_pos:
-        # Compare Y positions (line changed = found)
-        if abs(before_pos[1] - after_pos[1]) < 5 and abs(before_pos[0] - after_pos[0]) < 10:
-            # Position didn't change much - might not be found
-            # But first search from start will always be at same position
-            # So we consider it found if we're doing the search
-            found = True  # Assume found for now, will improve detection
-    
-    # Select entire line: Home then Shift+End
-    pyautogui.press('home')
     time.sleep(0.1)
-    pyautogui.hotkey('shift', 'end')
-    time.sleep(0.3)
     
-    return found
+    # Close Find dialog only if we opened it
+    if not dialog_open:
+        pyautogui.press('escape')
+        time.sleep(0.05)
+    
+    return True
+
+
+def select_current_line():
+    """Selects the entire current line."""
+    pyautogui.press('home')
+    time.sleep(0.02)
+    pyautogui.hotkey('shift', 'end')
+    time.sleep(0.05)
+
+
+def open_find_dialog():
+    """Opens the Find dialog in Notepad++."""
+    ensure_notepad_focus()
+    pyautogui.hotkey('ctrl', 'f')
+    time.sleep(0.1)
+
+
+def close_find_dialog():
+    """Closes the Find dialog."""
+    pyautogui.press('escape')
+    time.sleep(0.05)
 
 
 def get_caret_position():
@@ -333,11 +596,10 @@ def get_caret_position():
     return pos[0], pos[1], 20
 
 
-def take_screenshot(filename: str) -> str:
+def take_screenshot(filename: str, silent: bool = True) -> str:
     """Takes a full screen screenshot and draws a red rectangle around the selected line."""
     if not os.path.exists(SCREENSHOT_FOLDER):
         os.makedirs(SCREENSHOT_FOLDER)
-        print(f"Created screenshot folder: {SCREENSHOT_FOLDER}")
     
     # Clean filename
     safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
@@ -347,7 +609,7 @@ def take_screenshot(filename: str) -> str:
     screenshot_path = os.path.join(SCREENSHOT_FOLDER, safe_filename)
     
     hwnd = NOTEPAD_HWND
-    time.sleep(0.2)
+    time.sleep(0.08)  # Reduced from 0.2s
     
     caret_x, caret_y, caret_height = get_caret_position()
     
@@ -377,7 +639,6 @@ def take_screenshot(filename: str) -> str:
         )
     
     screenshot.save(screenshot_path)
-    print(f"Screenshot saved: {screenshot_path}")
     
     return screenshot_path
 
@@ -391,33 +652,61 @@ def close_notepad_plus():
             win32gui.SetForegroundWindow(NOTEPAD_HWND)
         except:
             pass
-        time.sleep(0.2)
+        time.sleep(0.1)  # Reduced from 0.2s
     
     pyautogui.hotkey('alt', 'F4')
-    time.sleep(0.3)
+    time.sleep(0.15)  # Reduced from 0.3s
     pyautogui.press('n')
-    time.sleep(0.2)
+    time.sleep(0.1)  # Reduced from 0.2s
     
     NOTEPAD_HWND = None
+
+
+def check_quit_key():
+    """Check if 'q' key was pressed (non-blocking)."""
+    if msvcrt.kbhit():
+        key = msvcrt.getch()
+        if key.lower() == b'q':
+            return True
+    return False
 
 
 def process_search_items(file_path: str, items: list):
     """
     Opens file and processes all search items.
     items: list of tuples (screenshot_name, field_code, search_term)
-    Returns: (screenshots_list, not_found_list)
+    Returns: (screenshots_list, not_found_list, was_quit)
     """
     process = open_notepad_plus_with_file(file_path)
     
     try:
         screenshots = []
         not_found = []
+        was_quit = False
+        
+        # TURBO MODE: Open Find dialog once, keep it open for all searches
+        open_find_dialog()
+        dialog_open = True
         
         for i, (screenshot_name, field_code, search_term) in enumerate(items, 1):
-            print(f"\n[{i}/{len(items)}] Searching for: '{search_term}' (Field: {field_code})")
+            # Check for quit key
+            if check_quit_key():
+                print("\n\n*** 'q' pressed - Quitting... ***")
+                was_quit = True
+                break
             
-            found = search_and_highlight(search_term)
-            time.sleep(0.3)
+            # Show simple progress (overwrite same line)
+            print(f"\r[{i}/{len(items)}] Processing: {field_code[:30]:<30} [Press 'q' to quit]", end='', flush=True)
+            
+            # Search with dialog already open (turbo mode)
+            found = search_and_highlight(search_term, dialog_open=True)
+            
+            # Close dialog temporarily to take screenshot, then reopen
+            close_find_dialog()
+            time.sleep(0.03)
+            
+            # Select the line for screenshot
+            select_current_line()
             
             # Use screenshot_name if provided, otherwise generate from field_code
             if screenshot_name and screenshot_name.lower() != 'nan':
@@ -428,17 +717,24 @@ def process_search_items(file_path: str, items: list):
             screenshot_path = take_screenshot(filename)
             screenshots.append(screenshot_path)
             
-            if found:
-                print(f"Screenshot saved for '{field_code}'")
-            else:
-                print(f"WARNING: '{search_term}' may not have been found!")
+            if not found:
                 not_found.append((field_code, search_term))
+            
+            # Reopen dialog for next search (if not last item and not quitting)
+            if i < len(items) and not was_quit:
+                open_find_dialog()
         
-        return screenshots, not_found
+        return screenshots, not_found, was_quit
         
     finally:
+        print()  # New line after progress
+        # Make sure dialog is closed before closing Notepad++
+        try:
+            pyautogui.press('escape')
+            time.sleep(0.02)
+        except:
+            pass
         close_notepad_plus()
-        print("\nNotepad++ closed.")
 
 
 def main():
@@ -448,18 +744,19 @@ def main():
         epilog="""
 Examples:
     python main.py --file EDI.txt --word "BHT03"
-    python main.py --file EDI.txt --word "BHT03,CLM05,DTP01"
     python main.py --file EDI.txt --list BHT03 BHT04 CLM05
     python main.py --file EDI.txt --txt fields.txt
     python main.py --file EDI.txt --excel input.xlsx
+    python main.py --file EDI.txt --excel input.xlsx --preview  # Preview only
         """
     )
     
     parser.add_argument('--file', '-f', required=True, help='Path to the file to open in Notepad++')
-    parser.add_argument('--word', '-w', help='Field code(s) to search for (comma-separated). Example: BHT03,CLM05')
+    parser.add_argument('--word', '-w', help='Single field code to search for. Example: BHT03')
     parser.add_argument('--list', '-l', nargs='+', help='List of field codes. Example: --list BHT03 BHT04 CLM05')
     parser.add_argument('--txt', '-t', help='Text file with field codes (one per line)')
     parser.add_argument('--excel', '-e', help='Excel file with "File name" and "Field" columns')
+    parser.add_argument('--preview', '-p', action='store_true', help='Preview search terms without running (dry run)')
     
     args = parser.parse_args()
     
@@ -500,60 +797,77 @@ Examples:
             items.append((field_code, field_code, search_term))
             
     elif args.word:
-        # Comma-separated input
-        for field_code in args.word.split(','):
-            field_code = field_code.strip()
-            if field_code:
-                segment, element_num, sub_element, search_term = parse_field_code(field_code)
-                items.append((field_code, field_code, search_term))
+        # Single field input
+        field_code = args.word.strip()
+        if field_code:
+            segment, element_num, sub_element, search_term = parse_field_code(field_code)
+            items.append((field_code, field_code, search_term))
     
     if not items:
         print("Error: No search terms provided. Use --word, --list, --txt, or --excel")
         return 1
     
-    print("=" * 60)
+    print("=" * 80)
     print("  NOTEPAD++ SEARCH AND SCREENSHOT TOOL")
-    print("=" * 60)
+    print("=" * 80)
     print(f"File: {file_path}")
     print(f"Search items: {len(items)}")
-    for name, code, term in items:
-        print(f"  - {name}: {term}")
     print(f"Screenshot folder: {SCREENSHOT_FOLDER}")
-    print("-" * 60)
+    print("-" * 80)
+    print(f"{'#':<5} {'GDF Field':<40} {'EDI Field':<30} {'Search Term':<20}")
+    print("-" * 80)
+    for i, (name, code, term) in enumerate(items, 1):
+        # Truncate long names for display
+        name_display = name[:38] + '..' if len(name) > 40 else name
+        code_display = code[:28] + '..' if len(code) > 30 else code
+        print(f"{i:<5} {name_display:<40} {code_display:<30} {term:<20}")
+    print("-" * 80)
     
-    print("\nStarting in 2 seconds... (Don't move the mouse!)")
-    time.sleep(2)
+    # If preview mode, just show the mapping and exit
+    if args.preview:
+        print("\n*** PREVIEW MODE - No search performed ***")
+        print(f"\nTotal items: {len(items)}")
+        return 0
     
-    screenshots, not_found = process_search_items(file_path, items)
+    print("\nStarting in 1 second... (Don't move the mouse! Press 'q' to quit anytime)")
+    time.sleep(1)  # Reduced from 2s
+    
+    screenshots, not_found, was_quit = process_search_items(file_path, items)
     
     print("\n" + "=" * 60)
-    print("  COMPLETE")
+    if was_quit:
+        print("  STOPPED BY USER")
+    else:
+        print("  COMPLETE")
     print("=" * 60)
     print(f"Total screenshots: {len(screenshots)}")
     print(f"Found: {len(screenshots) - len(not_found)}")
     print(f"Not found: {len(not_found)}")
     
-    print("\nScreenshots:")
-    for path in screenshots:
-        print(f"  - {path}")
-    
-    # Log not found fields
+    # Log not found fields in table format
     if not_found:
-        print("\n" + "-" * 60)
-        print("  FIELDS NOT FOUND:")
-        print("-" * 60)
-        for field_code, search_term in not_found:
-            print(f"  - {field_code} (searched: {search_term})")
+        print("\n" + "=" * 70)
+        print("  NOT FOUND ITEMS")
+        print("=" * 70)
+        print(f"{'#':<5} {'Field':<35} {'Searched':<25}")
+        print("-" * 70)
+        for idx, (field_code, search_term) in enumerate(not_found, 1):
+            field_display = field_code[:33] + '..' if len(field_code) > 35 else field_code
+            term_display = search_term[:23] + '..' if len(search_term) > 25 else search_term
+            print(f"{idx:<5} {field_display:<35} {term_display:<25}")
+        print("-" * 70)
         
         # Save to log file
         log_path = os.path.join(SCREENSHOT_FOLDER, "not_found.log")
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(f"Not Found Fields - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 50 + "\n\n")
-            for field_code, search_term in not_found:
-                f.write(f"{field_code} (searched: {search_term})\n")
+            f.write("=" * 70 + "\n")
+            f.write(f"{'#':<5} {'Field':<35} {'Searched':<25}\n")
+            f.write("-" * 70 + "\n")
+            for idx, (field_code, search_term) in enumerate(not_found, 1):
+                f.write(f"{idx:<5} {field_code:<35} {search_term:<25}\n")
         
-        print(f"\nNot found fields logged to: {log_path}")
+        print(f"\nLog saved: {log_path}")
     
     return 0
 
